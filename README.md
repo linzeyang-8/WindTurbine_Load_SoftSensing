@@ -2,14 +2,13 @@
 This warehouse corresponds to the core resources of the paper Transferable Soft Sensing Method for Wind Turbine Structural Loads Driven by Measurable Multi-dimensional Time Series Data for reviewers to quickly reproduce the experimental results, including code, data set, pre-trained model and key result diagram.
 
 1.Repository Structure
- WindTurbine_Load_SoftSensing/
 1_codes/                # 6 core experimental scripts (rename.txt to .py to run)
-GVAM-RN_dimensionality_reduction.txt  # Trained GVAM-RN dimensionality reduction model 
-5-DR-methods-for-Estimation.txt        # 5MW data: Comparison of 5 dimensionality reduction methods (GVAM-RN/VAM-RN/etc.)
-Comparison_of_5MW_noisy_test_set.txt      # 5MW noisy data: Load estimation robustness verification (10%/20% noise)
-ITP-MAML-1.5MW-Data_Quantification.txt  # 1.5MW target turbine: Data quantity quantification (20/30/50/70 samples) ITP-MAML_generates_pth.txt          
-ITP-MAML_generates_pth.txt  # ITP-MAML  #training: Generate optimal θ*.pth parameters
-4_Transfer_Comparisons-1.5MW.txt    # 1.5MW data: Comparison of 4 transfer learning methods (ITP-MAML/MAML/etc.)
+   GVAM-RN_dimensionality_reduction.txt  # Trained GVAM-RN dimensionality reduction model 
+   5-DR-methods-for-Estimation.txt        # 5MW data: Comparison of 5 dimensionality reduction methods (GVAM-RN/VAM-RN/etc.)
+   Comparison_of_5MW_noisy_test_set.txt      # 5MW noisy data: Load estimation robustness verification (10%/20% noise)
+   ITP-MAML-1.5MW-Data_Quantification.txt  # 1.5MW target turbine: Data quantity quantification (20/30/50/70 samples) ITP-MAML_generates_pth.txt          
+   ITP-MAML_generates_pth.txt  # ITP-MAML  #training: Generate optimal θ*.pth parameters
+   4_Transfer_Comparisons-1.5MW.txt    # 1.5MW data: Comparison of 4 transfer learning methods (ITP-MAML/MAML/etc.)
 
 2_Datasets/            # Contains the original data sets required for the experiment: specifically, there are 5MW original training set and test set and corresponding target variables, 5MW noisy test set, 1.5 MW original data set with different training sample numbers and corresponding target variables, 10 groups of test sets and corresponding target variables
 
