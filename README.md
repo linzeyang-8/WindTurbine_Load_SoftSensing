@@ -3,16 +3,16 @@ This warehouse corresponds to the core resources of the paper Transferable Soft 
 
 1.Repository Structure
 1_codes/   # 6 core experimental scripts (rename.txt to .py to run)
-   GVAM-RN_dimensionality_reduction.txt  # Trained GVAM-RN dimensionality reduction model 
-   5-DR-methods-for-Estimation.txt        # 5MW data: Comparison of 5 dimensionality reduction methods (GVAM-RN/VAM-RN/etc.)
-   Comparison_of_5MW_noisy_test_set.txt      # 5MW noisy data: Load estimation robustness verification (10%/20% noise)
-   ITP-MAML-1.5MW-Data_Quantification.txt  # 1.5MW target turbine: Data quantity quantification (20/30/50/70 samples) ITP-MAML_generates_pth.txt          
-   ITP-MAML_generates_pth.txt  # ITP-MAML  #training: Generate optimal θ*.pth parameters
-   4_Transfer_Comparisons-1.5MW.txt    # 1.5MW data: Comparison of 4 transfer learning methods (ITP-MAML/MAML/etc.)
+   Ⅰ. GVAM-RN_dimensionality_reduction.txt  # Trained GVAM-RN dimensionality reduction model 
+   Ⅱ. 5-DR-methods-for-Estimation.txt        # 5MW data: Comparison of 5 dimensionality reduction methods (GVAM-RN/VAM-RN/etc.)
+   Ⅲ. Comparison_of_5MW_noisy_test_set.txt      # 5MW noisy data: Load estimation robustness verification (10%/20% noise)
+   Ⅳ. ITP-MAML-1.5MW-Data_Quantification.txt  # 1.5MW target turbine: Data quantity quantification (20/30/50/70 samples) ITP-MAML_generates_pth.txt          
+   Ⅴ. ITP-MAML_generates_pth.txt  # ITP-MAML  #training: Generate optimal θ*.pth parameters
+   Ⅵ. 4_Transfer_Comparisons-1.5MW.txt    # 1.5MW data: Comparison of 4 transfer learning methods (ITP-MAML/MAML/etc.)
 
-2_Datasets/  # Contains the original data sets required for the experiment: specifically, there are 5MW original training set and test set and corresponding target variables, 5MW noisy test set, 1.5 MW original data set with different training sample numbers and corresponding target variables, 10 groups of test sets and corresponding target variables
+2_Datasets/  #Contains the original data sets required for the experiment: specifically, there are target variables of 5MW training set and test set, 5MW noise test set and original test set, 1.5 MW original data sets with different training samples and corresponding target variables, 10 groups of test sets and corresponding target variables
 
-3_Dimensionality_reduction_file/  # Contains the dimensionality reduction data sets required for the experiment: specifically, there are 5MW dimensionality reduction training set and test set, 5MW noisy dimensionality reduction test set, 1.5 MW dimensionality reduction training set and dimensionality reduction test set with different number of training samples.
+3_Dimensionality_reduction_file/  # Contains the dimensionality reduction data set required for the experiment: This file mainly includes the 1.5 MW dimensionality reduction training set and dimensionality reduction test set with different training samples, as well as the 5MW noise dimensionality reduction test set and the original dimensionality reduction test set.
 
 4_Model_weights/  # Pretrained .pth weights (load directly for inference)
   ├─ feature_extractor.pth    # Optimal Weight and Bias of GVAM-RN Dimensionality Reduction Model
