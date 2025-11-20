@@ -1,0 +1,606 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+import random
+import os
+import pickle  # For saving/loading scalers
+
+# Set random seeds
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
+
+
+def set_random_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def create_data_loaders(dataset, batch_size, shuffle=True):
+    generator = torch.Generator().manual_seed(42)
+    return DataLoader(
+        dataset, batch_size=batch_size, shuffle=shuffle,
+        worker_init_fn=seed_worker, generator=generator
+    )
+
+
+# -------------------------- 【All Paths Configuration】--------------------------
+# Input paths (only keep feature data paths, remove all target variable paths)
+input_paths = {
+    # Training data related (original 5MW)
+    'train_data': r"E:\Codes_and_datasets\Datasets\48000-Training_data.xlsx",
+    'train_targets': r'E:\Codes_and_datasets\Datasets\48000-Training_data-DEL.xlsx',
+    # 5MW training target variables (required for model training)
+
+    # Test data related (original two 5MW test sets)
+    'test1_data': r"E:\Codes_and_datasets\Datasets\10-Test_data3-10%.xlsx",
+    'test2_data': r'E:\Codes_and_datasets\Datasets\10-Test_data.xlsx',
+
+    # OP1.5MW data related (only keep training set + test set feature paths)
+    'openfast_train_data': r"E:\Codes_and_datasets\Datasets\1.5MW\OP1.5MW_50_Train.xlsx",  # 1.5MW training set
+    'openfast_test_data': r"E:\Codes_and_datasets\Datasets\1.5MW\OP1.5MW_10_Test.xlsx",
+    # 1.5MW test set (modify path later)
+
+    # OP10MW data related (only keep training set + test set feature paths)
+    'op10mw_train_data': r"E:\Codes_and_datasets\Datasets\10MW\OP10MW_50_Train.xlsx",  # 10MW training set
+    'op10mw_test_data': r"E:\Codes_and_datasets\Datasets\10MW\OP10MW_10_Test.xlsx",  # 10MW test set (modify path later)
+
+    # Model and Scalers loading paths
+    'model_weights': r'E:\Codes_and_datasets\Model_weights\feature_extractor.pth',
+    'scalers': r'E:\Codes_and_datasets\Model_weights\scalers.pkl',
+}
+
+# Output paths (dimensionality reduction results) - keep dual output for training set + test set
+output_paths = {
+    # Dimensionality reduction result output directory
+    'encoded_output_dir': r'E:\Codes_and_datasets\Dimensionality_reduction_file',
+
+    # Original 5MW training set related output
+    'train_encoded': 'SF5MW_encoded_48000_Train.xlsx',
+    # Original 5MW noisy test set related output
+    'test1_encoded': 'SF5MW_encoded_10_Test(3-10%).xlsx',
+    # Original 5MW test set related output
+    'test2_encoded': 'SF5MW_encoded_10_Test.xlsx',
+
+    # OP1.5MW related output (training set + test set)
+    'openfast_train_encoded': 'OP1.5MW_encoded_50_Train.xlsx',  # 1.5MW training set dimensionality reduction result
+    'openfast_test_encoded': 'OP1.5MW_encoded_10_Test.xlsx',  # 1.5MW test set dimensionality reduction result
+
+    # OP10MW related output (training set + test set)
+    'op10mw_train_encoded_prefix': 'OP10MW_encoded_50_Train.xlsx',  # 10MW training set dimensionality reduction
+    'op10mw_test_encoded_prefix': 'OP10MW_encoded_10_Test.xlsx',  # 10MW test set dimensionality reduction
+}
+
+# -------------------------- 【Model Parameters Configuration】--------------------------
+model_params = {
+    'hidden_dims_extractor': [2024, 512, 256],
+    'input_dim': 1204,
+    'feature_output_dim': 32,
+    'target_output_dim': 2,
+    'dropout_rate': 0.01,
+    'prelu_init': 1.2,
+    'initial_lr': 0.01,
+    'hidden_dims_predictor': [2024, 512, 256],
+    'epsilon': 0.01,
+    'num_epochs': 500,
+    'batch_size': 64,
+    'weight_decay': 0.01,
+    'lr_scheduler_factor': 0.5,
+    'lr_scheduler_patience': 5,
+    'num_variables': 4,
+    'time_steps': 301
+}
+
+# -------------------------- 【Run Mode Configuration】--------------------------
+run_config = {
+    'mode': "infer",  # Set to "train" for first training, set to "infer" for subsequent data processing only
+    'input_paths': input_paths,
+    'output_paths': output_paths,
+    'model_params': model_params
+}
+
+
+def load_data(mode="train"):
+    input_paths = run_config['input_paths']
+
+    # Load original 5MW training data (only needed for train mode)
+    if mode == "train":
+        X_train = pd.read_excel(input_paths['train_data'])
+        print(f"5MW X_train shape: {X_train.shape}")
+
+        # Load 5MW target variables (required for model training, keep)
+        targets_train = pd.read_excel(input_paths['train_targets'])
+        y_train_DELMt = targets_train['DELMt'].values.astype(np.float32)
+        y_train_DELTs = targets_train['DELTs'].values.astype(np.float32)
+        X_train = X_train.values.astype(np.float32)
+    else:
+        X_train = None
+        y_train_DELMt = None
+        y_train_DELTs = None
+
+    # Load original two 5MW test data
+    X_test1 = pd.read_excel(input_paths['test1_data']).values.astype(np.float32)
+    X_test2 = pd.read_excel(input_paths['test2_data']).values.astype(np.float32)
+    print(f"5MW X_test1 shape: {X_test1.shape}")
+    print(f"5MW X_test2 shape: {X_test2.shape}")
+
+    # Normalization processing
+    if mode == "train":
+        # Train mode: fit scalers and save
+        scalers = [StandardScaler() for _ in range(4)]
+        for i in range(4):
+            start_idx = i * 301
+            end_idx = (i + 1) * 301
+            if X_train is not None:
+                X_train[:, start_idx:end_idx] = scalers[i].fit_transform(X_train[:, start_idx:end_idx])
+            X_test1[:, start_idx:end_idx] = scalers[i].transform(X_test1[:, start_idx:end_idx])
+            X_test2[:, start_idx:end_idx] = scalers[i].transform(X_test2[:, start_idx:end_idx])
+        # Save scalers to file
+        with open(input_paths['scalers'], 'wb') as f:
+            pickle.dump(scalers, f)
+        print(f"Scalers saved to: {input_paths['scalers']}")
+    else:
+        # Infer mode: load saved scalers
+        with open(input_paths['scalers'], 'rb') as f:
+            scalers = pickle.load(f)
+        print(f"Scalers loaded from: {input_paths['scalers']}")
+        # Normalize 5MW test sets
+        for i in range(4):
+            start_idx = i * 301
+            end_idx = (i + 1) * 301
+            X_test1[:, start_idx:end_idx] = scalers[i].transform(X_test1[:, start_idx:end_idx])
+            X_test2[:, start_idx:end_idx] = scalers[i].transform(X_test2[:, start_idx:end_idx])
+
+    return X_train, y_train_DELMt, y_train_DELTs, X_test1, X_test2, scalers
+
+
+# -------------------------- OP1.5MW Data Loading (feature data only, no target variables) --------------------------
+def load_openfast_data(scalers, data_type="train"):
+    input_paths = run_config['input_paths']
+    if data_type == "train":
+        file_path = input_paths['openfast_train_data']
+        data_name = "OP1.5MW Train Data"
+    elif data_type == "test":
+        file_path = input_paths['openfast_test_data']
+        data_name = "OP1.5MW Test Data"
+    else:
+        raise ValueError(f"Invalid data_type: {data_type}, must be 'train' or 'test'")
+
+    try:
+        # Load feature data only
+        X_data = pd.read_excel(file_path).values.astype(np.float32)
+        print(f"\n{data_name} shape: {X_data.shape}")
+
+        # Normalization (reuse scalers trained on 5MW)
+        for i in range(4):
+            start_idx = i * 301
+            end_idx = (i + 1) * 301
+            X_data[:, start_idx:end_idx] = scalers[i].transform(X_data[:, start_idx:end_idx])
+
+        print(f"{data_name} loaded and normalized successfully")
+        return X_data
+    except FileNotFoundError:
+        print(f"\n❌ {data_name} file not found: {file_path}")
+        return None
+    except Exception as e:
+        print(f"\n❌ {data_name} loading error: {str(e)}")
+        return None
+
+
+# -------------------------- OP10MW Data Loading (feature data only, no target variables) --------------------------
+def load_op10mw_data(scalers, data_type="train"):
+    input_paths = run_config['input_paths']
+    if data_type == "train":
+        file_path = input_paths['op10mw_train_data']
+        data_name = "OP10MW Train Data"
+    elif data_type == "test":
+        file_path = input_paths['op10mw_test_data']
+        data_name = "OP10MW Test Data"
+    else:
+        raise ValueError(f"Invalid data_type: {data_type}, must be 'train' or 'test'")
+
+    try:
+        # Load feature data only
+        X_data = pd.read_excel(file_path).values.astype(np.float32)
+        print(f"\n{data_name} shape: {X_data.shape}")
+
+        # Verify column count
+        if X_data.shape[1] != model_params['input_dim']:
+            raise ValueError(
+                f"{data_name} column error! Required {model_params['input_dim']}, actual {X_data.shape[1]}")
+
+        # Normalization (reuse scalers trained on 5MW)
+        for i in range(4):
+            start_idx = i * 301
+            end_idx = (i + 1) * 301
+            X_data[:, start_idx:end_idx] = scalers[i].transform(X_data[:, start_idx:end_idx])
+
+        print(f"{data_name} loaded and normalized successfully")
+        return X_data
+    except FileNotFoundError:
+        print(f"\n❌ {data_name} file not found: {file_path}")
+        return None
+    except Exception as e:
+        print(f"\n❌ {data_name} loading error: {str(e)}")
+        return None
+
+
+# Variable Attention Mechanism Module (unchanged)
+class VariableAttention(nn.Module):
+    def __init__(self, num_variables, time_steps):
+        super(VariableAttention, self).__init__()
+        self.num_variables = num_variables
+        self.time_steps = time_steps
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.attention_net = nn.Sequential(
+            nn.Linear(num_variables, num_variables // 2),
+            nn.ReLU(),
+            nn.Linear(num_variables // 2, num_variables),
+            nn.Softmax(dim=1)
+        )
+
+    def forward(self, x):
+        batch_size = x.shape[0]
+        x_reshaped = x.view(batch_size, self.num_variables, self.time_steps)
+        var_avg = self.avg_pool(x_reshaped).squeeze(-1)
+        attention_weights = self.attention_net(var_avg)
+        expanded_weights = attention_weights.unsqueeze(-1).expand(-1, -1, self.time_steps)
+        expanded_weights = expanded_weights.reshape(batch_size, -1)
+        weighted_x = x * expanded_weights
+        return weighted_x, attention_weights
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_features, out_features, dropout_rate):
+        super(ResidualBlock, self).__init__()
+        self.fc1 = nn.Linear(in_features, out_features)
+        self.prelu = nn.PReLU()
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc2 = nn.Linear(out_features, out_features)
+        self.shortcut = nn.Linear(in_features, out_features) if in_features != out_features else nn.Identity()
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        out = self.fc1(x)
+        out = self.prelu(out)
+        out = self.dropout(out)
+        out = self.fc2(out)
+        out += identity
+        out = self.prelu(out)
+        return out
+
+
+class FeatureExtractor(nn.Module):
+    def __init__(self, input_dim, hidden_dims, output_dim, dropout_rate=None, prelu_init=None, num_variables=4,
+                 time_steps=301):
+        super(FeatureExtractor, self).__init__()
+        self.dropout_rate = dropout_rate
+        self.num_variables = num_variables
+        self.time_steps = time_steps
+        self.var_attention = VariableAttention(num_variables, time_steps)
+        self.initial_layer = nn.Sequential(
+            nn.Linear(input_dim, hidden_dims[0]),
+            nn.PReLU(num_parameters=hidden_dims[0], init=prelu_init),
+            nn.Dropout(dropout_rate)
+        )
+        self.residual_blocks = nn.ModuleList([
+            ResidualBlock(hidden_dims[i], hidden_dims[i + 1], dropout_rate) for i in range(len(hidden_dims) - 1)
+        ])
+        self.final_layer = nn.Linear(hidden_dims[-1], output_dim)
+
+    def forward(self, x):
+        x, attention_weights = self.var_attention(x)
+        x = self.initial_layer(x)
+        for block in self.residual_blocks:
+            x = block(x)
+        x = self.final_layer(x)
+        return x, attention_weights
+
+
+class Predictor(nn.Module):
+    def __init__(self, input_dim, hidden_dims, output_dim, dropout_rate):
+        super(Predictor, self).__init__()
+        self.predictor = nn.Sequential(
+            nn.Linear(input_dim, hidden_dims[0]),
+            nn.PReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dims[0], hidden_dims[1]),
+            nn.PReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dims[1], hidden_dims[2]),
+            nn.PReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dims[2], output_dim)
+        )
+
+    def forward(self, x):
+        return self.predictor(x)
+
+
+def fgsm_attack(image, epsilon, data_grad):
+    sign_data_grad = data_grad.sign()
+    perturbed_image = image + epsilon * sign_data_grad
+    return perturbed_image
+
+
+# Function to save dimensionality reduction data (save only feature dimensionality reduction results, no target variables)
+def save_encoded_data(X_train_encoded, X_test1_encoded, X_test2_encoded,
+                      openfast_train_encoded, openfast_test_encoded,
+                      op10mw_train_encoded, op10mw_test_encoded, epoch):
+    input_paths = run_config['input_paths']
+    output_paths = run_config['output_paths']
+    params = run_config['model_params']
+    output_dir = output_paths['encoded_output_dir']
+
+    os.makedirs(output_dir, exist_ok=True)
+    feature_dim = params['feature_output_dim']
+    feature_cols = [f'feature_{i}' for i in range(feature_dim)]
+
+    # 1. Save original 5MW related dimensionality reduction results
+    if X_train_encoded is not None:
+        X_train_encoded_df = pd.DataFrame(X_train_encoded, columns=feature_cols)
+        train_save_path = os.path.join(output_dir, output_paths['train_encoded'])
+        X_train_encoded_df.to_excel(train_save_path, index=False)
+        print(f"5MW X_train_encoded shape: {X_train_encoded_df.shape}, saved to: {os.path.basename(train_save_path)}")
+
+    X_test1_encoded_df = pd.DataFrame(X_test1_encoded, columns=feature_cols)
+    X_test2_encoded_df = pd.DataFrame(X_test2_encoded, columns=feature_cols)
+    test1_save_path = os.path.join(output_dir, output_paths['test1_encoded'])
+    test2_save_path = os.path.join(output_dir, output_paths['test2_encoded'])
+    X_test1_encoded_df.to_excel(test1_save_path, index=False)
+    X_test2_encoded_df.to_excel(test2_save_path, index=False)
+    print(f"5MW X_test1_encoded saved to: {os.path.basename(test1_save_path)}")
+    print(f"5MW X_test2_encoded saved to: {os.path.basename(test2_save_path)}")
+
+    # 2. Save OP1.5MW training set + test set dimensionality reduction results
+    if openfast_train_encoded is not None:
+        openfast_train_df = pd.DataFrame(openfast_train_encoded, columns=feature_cols)
+        openfast_train_save = os.path.join(output_dir, output_paths['openfast_train_encoded'])
+        openfast_train_df.to_excel(openfast_train_save, index=False)
+        print(
+            f"OP1.5MW Train_encoded shape: {openfast_train_df.shape}, saved to: {os.path.basename(openfast_train_save)}")
+
+    if openfast_test_encoded is not None:
+        openfast_test_df = pd.DataFrame(openfast_test_encoded, columns=feature_cols)
+        openfast_test_save = os.path.join(output_dir, output_paths['openfast_test_encoded'])
+        openfast_test_df.to_excel(openfast_test_save, index=False)
+        print(f"OP1.5MW Test_encoded shape: {openfast_test_df.shape}, saved to: {os.path.basename(openfast_test_save)}")
+
+    # 3. Save OP10MW training set + test set dimensionality reduction results
+    if op10mw_train_encoded is not None:
+        op10mw_train_save = os.path.join(output_dir, output_paths['op10mw_train_encoded_prefix'])
+        op10mw_train_df = pd.DataFrame(op10mw_train_encoded, columns=feature_cols)
+        op10mw_train_df.to_excel(op10mw_train_save, index=False)
+        print(f"OP10MW Train_encoded shape: {op10mw_train_df.shape}, saved to: {os.path.basename(op10mw_train_save)}")
+
+    if op10mw_test_encoded is not None:
+        op10mw_test_save = os.path.join(output_dir, output_paths['op10mw_test_encoded_prefix'])
+        op10mw_test_df = pd.DataFrame(op10mw_test_encoded, columns=feature_cols)
+        op10mw_test_df.to_excel(op10mw_test_save, index=False)
+        print(f"OP10MW Test_encoded shape: {op10mw_test_df.shape}, saved to: {os.path.basename(op10mw_test_save)}")
+
+    print("=" * 80)
+
+
+# -------------------------- Main Process (execute by mode) --------------------------
+set_random_seed(42)
+params = run_config['model_params']
+input_paths = run_config['input_paths']
+output_paths = run_config['output_paths']
+
+# 1. Load base data and Scalers (5MW related)
+X_train_5mw, y_train_DELMt, y_train_DELTs, X_test1_5mw, X_test2_5mw, scalers = load_data(
+    mode=run_config['mode']
+)
+
+# 2. Load OP1.5MW training set + test set (feature data only)
+print("\n" + "=" * 60)
+print("Loading OP1.5MW datasets...")
+X_openfast_train = load_openfast_data(scalers, data_type="train")
+X_openfast_test = load_openfast_data(scalers, data_type="test")
+
+# 3. Load OP10MW training set + test set (feature data only)
+print("\n" + "=" * 60)
+print("Loading OP10MW datasets...")
+X_op10mw_train = load_op10mw_data(scalers, data_type="train")
+X_op10mw_test = load_op10mw_data(scalers, data_type="test")
+
+# 4. Initialize/load feature extractor
+feature_extractor = FeatureExtractor(
+    input_dim=params['input_dim'],
+    hidden_dims=params['hidden_dims_extractor'],
+    output_dim=params['feature_output_dim'],
+    dropout_rate=params['dropout_rate'],
+    prelu_init=params['prelu_init'],
+    num_variables=params['num_variables'],
+    time_steps=params['time_steps']
+)
+
+# 5. Execute by mode
+if run_config['mode'] == "train":
+    # Train mode: train with 5MW data, reduce dimensionality for all datasets after saving model
+    print("\n" + "=" * 80)
+    print("Starting training mode, executing 500 epochs of training...")
+    print("=" * 80)
+
+    # Initialize predictor (only needed for training)
+    predictor = Predictor(
+        input_dim=params['feature_output_dim'],
+        hidden_dims=params['hidden_dims_predictor'],
+        output_dim=params['target_output_dim'],
+        dropout_rate=params['dropout_rate']
+    )
+
+    # Loss function, optimizer, scheduler
+    criterion = nn.SmoothL1Loss()
+    optimizer = optim.AdamW(
+        list(feature_extractor.parameters()) + list(predictor.parameters()),
+        lr=params['initial_lr'],
+        weight_decay=params['weight_decay']
+    )
+    scheduler = ReduceLROnPlateau(
+        optimizer, mode='min', factor=params['lr_scheduler_factor'], patience=params['lr_scheduler_patience']
+    )
+
+    # Construct 5MW training dataset (keep, as target variables are required for model training)
+    y_train_5mw = np.column_stack((y_train_DELMt, y_train_DELTs))
+    train_dataset = TensorDataset(torch.tensor(X_train_5mw), torch.tensor(y_train_5mw))
+    train_loader = create_data_loaders(train_dataset, batch_size=params['batch_size'], shuffle=True)
+
+    # Training loop
+    prev_lr = params['initial_lr']
+    for epoch in range(params['num_epochs']):
+        feature_extractor.train()
+        predictor.train()
+        total_loss = 0.0
+        total_attention = torch.zeros(params['num_variables'])
+
+        for x_train, y_train_batch in train_loader:
+            optimizer.zero_grad()
+            x_train.requires_grad = True
+
+            features, attention_weights = feature_extractor(x_train)
+            features.retain_grad()
+
+            intermediate_output = predictor(features)
+            loss = criterion(intermediate_output, y_train_batch)
+            loss.backward(retain_graph=True)
+
+            perturbed_features = fgsm_attack(features, params['epsilon'], features.grad)
+            perturbed_intermediate_output = predictor(perturbed_features)
+            perturbed_loss = criterion(perturbed_intermediate_output, y_train_batch)
+
+            total_loss += loss.item() + perturbed_loss.item()
+            total_attention += attention_weights.mean(dim=0).detach()
+
+            combined_loss = loss + perturbed_loss
+            combined_loss.backward()
+            optimizer.step()
+
+        avg_loss = total_loss / len(train_loader)
+        avg_attention = (total_attention / len(train_loader)).numpy()
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"\nTrain Epoch {epoch + 1}/{params['num_epochs']}")
+        print(f"Loss: {avg_loss:.4f}, Learning Rate: {current_lr:.6f}")
+        print(f"Average Attention Weights: {dict(zip(['Var1', 'Var2', 'Var3', 'Var4'], avg_attention))}")
+
+        scheduler.step(avg_loss)
+        if current_lr != prev_lr:
+            print(f"Learning rate updated to {current_lr:.6f}")
+            prev_lr = current_lr
+
+        # After training (500 epochs), reduce dimensionality for all datasets and save
+        if (epoch + 1) % 500 == 0:
+            feature_extractor.eval()
+            with torch.no_grad():
+                # 5MW related dimensionality reduction
+                X_train_5mw_encoded, _ = feature_extractor(torch.tensor(X_train_5mw))
+                X_test1_5mw_encoded, _ = feature_extractor(torch.tensor(X_test1_5mw))
+                X_test2_5mw_encoded, _ = feature_extractor(torch.tensor(X_test2_5mw))
+
+                # OP1.5MW related dimensionality reduction
+                X_openfast_train_encoded = feature_extractor(torch.tensor(X_openfast_train))[
+                    0] if X_openfast_train is not None else None
+                X_openfast_test_encoded = feature_extractor(torch.tensor(X_openfast_test))[
+                    0] if X_openfast_test is not None else None
+
+                # OP10MW related dimensionality reduction
+                X_op10mw_train_encoded = feature_extractor(torch.tensor(X_op10mw_train))[
+                    0] if X_op10mw_train is not None else None
+                X_op10mw_test_encoded = feature_extractor(torch.tensor(X_op10mw_test))[
+                    0] if X_op10mw_test is not None else None
+
+                # Convert to numpy
+                X_train_5mw_encoded = X_train_5mw_encoded.numpy()
+                X_test1_5mw_encoded = X_test1_5mw_encoded.numpy()
+                X_test2_5mw_encoded = X_test2_5mw_encoded.numpy()
+                X_openfast_train_encoded = X_openfast_train_encoded.numpy() if X_openfast_train_encoded is not None else None
+                X_openfast_test_encoded = X_openfast_test_encoded.numpy() if X_openfast_test_encoded is not None else None
+                X_op10mw_train_encoded = X_op10mw_train_encoded.numpy() if X_op10mw_train_encoded is not None else None
+                X_op10mw_test_encoded = X_op10mw_test_encoded.numpy() if X_op10mw_test_encoded is not None else None
+
+            # Save all dimensionality reduction results (including training/test sets)
+            save_encoded_data(
+                X_train_encoded=X_train_5mw_encoded,
+                X_test1_encoded=X_test1_5mw_encoded,
+                X_test2_encoded=X_test2_5mw_encoded,
+                openfast_train_encoded=X_openfast_train_encoded,
+                openfast_test_encoded=X_openfast_test_encoded,
+                op10mw_train_encoded=X_op10mw_train_encoded,
+                op10mw_test_encoded=X_op10mw_test_encoded,
+                epoch=epoch + 1
+            )
+
+    # Save feature extractor weights after training completion
+    torch.save(feature_extractor.state_dict(), input_paths['model_weights'])
+    print(f"\nTraining completed! Feature extractor weights saved to: {input_paths['model_weights']}")
+
+else:
+    # Infer mode: load trained model, reduce dimensionality for all datasets and save
+    print("\n" + "=" * 80)
+    print("Starting inference mode, only dimensionality reduction without training...")
+    print("=" * 80)
+
+    # Load model weights
+    if os.path.exists(input_paths['model_weights']):
+        feature_extractor.load_state_dict(torch.load(input_paths['model_weights'], weights_only=True))
+        print(f"Model weights loaded successfully: {input_paths['model_weights']}")
+    else:
+        raise FileNotFoundError(f"Model weights not found! Please first train and save the model in 'train' mode")
+
+    # Perform dimensionality reduction for all datasets
+    feature_extractor.eval()
+    with torch.no_grad():
+        # 5MW related dimensionality reduction
+        X_test1_5mw_encoded, _ = feature_extractor(torch.tensor(X_test1_5mw))
+        X_test2_5mw_encoded, _ = feature_extractor(torch.tensor(X_test2_5mw))
+
+        # OP1.5MW related dimensionality reduction
+        X_openfast_train_encoded = feature_extractor(torch.tensor(X_openfast_train))[
+            0] if X_openfast_train is not None else None
+        X_openfast_test_encoded = feature_extractor(torch.tensor(X_openfast_test))[
+            0] if X_openfast_test is not None else None
+
+        # OP10MW related dimensionality reduction
+        X_op10mw_train_encoded = feature_extractor(torch.tensor(X_op10mw_train))[
+            0] if X_op10mw_train is not None else None
+        X_op10mw_test_encoded = feature_extractor(torch.tensor(X_op10mw_test))[0] if X_op10mw_test is not None else None
+
+        # Convert to numpy
+        X_test1_5mw_encoded = X_test1_5mw_encoded.numpy()
+        X_test2_5mw_encoded = X_test2_5mw_encoded.numpy()
+        X_openfast_train_encoded = X_openfast_train_encoded.numpy() if X_openfast_train_encoded is not None else None
+        X_openfast_test_encoded = X_openfast_test_encoded.numpy() if X_openfast_test_encoded is not None else None
+        X_op10mw_train_encoded = X_op10mw_train_encoded.numpy() if X_op10mw_train_encoded is not None else None
+        X_op10mw_test_encoded = X_op10mw_test_encoded.numpy() if X_op10mw_test_encoded is not None else None
+
+    # Save all dimensionality reduction results (including training/test sets)
+    save_encoded_data(
+        X_train_encoded=None,  # Do not save 5MW training set in inference mode
+        X_test1_encoded=X_test1_5mw_encoded,
+        X_test2_encoded=X_test2_5mw_encoded,
+        openfast_train_encoded=X_openfast_train_encoded,
+        openfast_test_encoded=X_openfast_test_encoded,
+        op10mw_train_encoded=X_op10mw_train_encoded,
+        op10mw_test_encoded=X_op10mw_test_encoded,
+        epoch=500  # Fixed as total training epochs
+    )
+
+    print(
+        "Inference completed! Dimensionality reduction results for all datasets have been saved (including training/test sets)")

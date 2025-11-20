@@ -1,0 +1,188 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+
+# Set random seeds
+torch.manual_seed(42)
+np.random.seed(42)
+
+# Load data
+def load_data():
+    # Source domain data
+    source_data = pd.read_excel(
+        r"E:\Codes_and_datasets\Dimensionality_reduction_file\5MW-Different_DR_models\X_train_encoded_GVAM-RN.xlsx")
+    source_targets = pd.read_excel(
+        r"E:\Codes_and_datasets\Datasets\48000-Training_data-DEL.xlsx")
+    y_source_DELMt = source_targets['DELMt'].values.astype(np.float32)
+    y_source_DELTs = source_targets['DELTs'].values.astype(np.float32)
+
+    # Convert to numpy arrays
+    X_source = source_data.values.astype(np.float32)
+
+    return X_source, y_source_DELMt, y_source_DELTs
+
+class ResidualBlockTask(nn.Module):
+    def __init__(self, dim, dropout_rate, prelu_init):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim)
+        self.prelu = nn.PReLU(num_parameters=dim, init=prelu_init)
+        self.dropout = nn.Dropout(dropout_rate)
+
+    def forward(self, x):
+        out = self.linear(x)
+        out = self.prelu(out)
+        out = self.dropout(out)
+        return out + x  # Residual connection
+
+# Define Multi-Task Model
+class MultiTaskModel(nn.Module):
+    def __init__(self, input_dim, hidden_dims, dropout_rate=None, prelu_init=None):
+        super(MultiTaskModel, self).__init__()
+        self.dropout_rate = dropout_rate  # Save dropout_rate as class attribute
+
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(input_dim, hidden_dims[0]),
+            nn.PReLU(num_parameters=hidden_dims[0], init=prelu_init),  # Independent parameters
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dims[0], hidden_dims[1]),
+            nn.PReLU(num_parameters=hidden_dims[1], init=prelu_init),  # Independent parameters
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dims[1], hidden_dims[2]),
+            nn.PReLU(num_parameters=hidden_dims[2], init=prelu_init),  # Independent parameters
+            nn.Dropout(dropout_rate)
+        )
+
+        self.task_classifier_DELMt = nn.Sequential(
+            ResidualBlockTask(hidden_dims[2], dropout_rate, prelu_init),
+            nn.Linear(hidden_dims[2], 1)
+        )
+
+        self.task_classifier_DELTs = nn.Sequential(
+            ResidualBlockTask(hidden_dims[2], dropout_rate, prelu_init),
+            nn.Linear(hidden_dims[2], 1)
+        )
+
+    def forward(self, x, params=None):
+        if params is None:
+            features = self.feature_extractor(x)
+            output_DELMt = self.task_classifier_DELMt(features)
+            output_DELTs = self.task_classifier_DELTs(features)
+        else:
+            param_idx = 0
+            # Feature extractor
+            x = nn.functional.linear(x, params[param_idx], params[param_idx + 1])
+            x = nn.functional.prelu(x, params[param_idx + 2])
+            x = nn.functional.dropout(x, p=self.dropout_rate, training=self.training)
+            param_idx += 3
+            x = nn.functional.linear(x, params[param_idx], params[param_idx + 1])
+            x = nn.functional.prelu(x, params[param_idx + 2])
+            x = nn.functional.dropout(x, p=self.dropout_rate, training=self.training)
+            param_idx += 3
+            features = nn.functional.linear(x, params[param_idx], params[param_idx + 1])
+            features = nn.functional.prelu(features, params[param_idx + 2])
+            features = nn.functional.dropout(features, p=self.dropout_rate, training=self.training)
+            param_idx += 3
+            # Task classifier DELMt
+            output_DELMt = nn.functional.linear(features, params[param_idx], params[param_idx + 1])
+            output_DELMt = nn.functional.prelu(output_DELMt, params[param_idx + 2])
+            output_DELMt = nn.functional.dropout(output_DELMt, p=self.dropout_rate, training=self.training)
+            output_DELMt = nn.functional.linear(output_DELMt, params[param_idx + 3], params[param_idx + 4])
+            param_idx += 5
+            # Task classifier DELTs
+            output_DELTs = nn.functional.linear(features, params[param_idx], params[param_idx + 1])
+            output_DELTs = nn.functional.prelu(output_DELTs, params[param_idx + 2])
+            output_DELTs = nn.functional.dropout(output_DELTs, p=self.dropout_rate, training=self.training)
+            output_DELTs = nn.functional.linear(output_DELTs, params[param_idx + 3], params[param_idx + 4])
+        return output_DELMt, output_DELTs
+
+# ITP-MAML meta-training function with adaptive learning rate
+def maml_train(model, source_loader, meta_optimizer, criterion_task, noise_scale, initial_inner_lr, inner_steps, epochs, lr_decay_factor=None, lr_threshold=None):
+    for epoch in range(epochs):
+        meta_loss = 0.0
+        for x_source, y_source in source_loader:
+            # Add Gaussian noise
+            noise = torch.randn_like(x_source) * noise_scale
+            x_source_noisy = x_source + noise
+
+            # Inner loop update
+            fast_weights = list(model.parameters())
+            prev_loss = None
+            current_inner_lr = initial_inner_lr
+            for _ in range(inner_steps):
+                output_DELMt, output_DELTs = model(x_source_noisy, params=fast_weights)
+                y_DELMt = y_source[:, 0].unsqueeze(1)
+                y_DELTs = y_source[:, 1].unsqueeze(1)
+                loss = criterion_task(output_DELMt, y_DELMt) + criterion_task(output_DELTs, y_DELTs)
+
+                if prev_loss is not None:
+                    # Reduce learning rate if loss decreases slowly
+                    if (prev_loss - loss).item() < lr_threshold:
+                        current_inner_lr *= lr_decay_factor
+
+                grads = torch.autograd.grad(loss, fast_weights, create_graph=True)
+                fast_weights = [w - current_inner_lr * g for w, g in zip(fast_weights, grads)]
+                prev_loss = loss
+
+            # Outer loop update
+            output_DELMt, output_DELTs = model(x_source_noisy, params=fast_weights)
+            y_DELMt = y_source[:, 0].unsqueeze(1)
+            y_DELTs = y_source[:, 1].unsqueeze(1)
+            meta_loss += criterion_task(output_DELMt, y_DELMt) + criterion_task(output_DELTs, y_DELTs)
+
+        meta_optimizer.zero_grad()
+        meta_loss.backward()
+        meta_optimizer.step()
+
+        # Print loss for each epoch
+        avg_loss = meta_loss.item() / len(source_loader)
+        print(f"MAML Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}")
+
+    # Save trained ITP-MAML model
+    torch.save(model.state_dict(), r'E:\Codes_and_datasets\Model_weights\ITP-MAML.pth')
+
+# Main program
+if __name__ == "__main__":
+    # Load data
+    X_source, y_source_DELMt, y_source_DELTs = load_data()
+
+    # Standardize input data and target variables
+    scaler_X = StandardScaler()
+    X_source = scaler_X.fit_transform(X_source)
+
+    scaler_y = StandardScaler()
+    y_source = scaler_y.fit_transform(np.column_stack((y_source_DELMt, y_source_DELTs)))
+
+    # Convert to PyTorch tensors
+    source_dataset = TensorDataset(torch.tensor(X_source, dtype=torch.float32),
+                                   torch.tensor(y_source, dtype=torch.float32))
+
+    # Data loader
+    source_loader = DataLoader(source_dataset, batch_size=320, shuffle=True)
+
+    # Parameter settings
+    hidden_dims = [2024, 512, 128]
+    dropout_rate = 0.01
+    prelu_init = 0.5
+    input_dim = 32
+    noise_scale = 0.01
+
+    # Initialize model
+    model = MultiTaskModel(input_dim=input_dim, hidden_dims=hidden_dims, dropout_rate=dropout_rate, prelu_init=prelu_init)
+
+    # ITP-MAML parameter settings
+    initial_inner_lr = 0.002  # Initial inner loop learning rate
+    inner_steps = 4  # Number of inner loop steps
+    meta_lr = 0.0002  # Meta learning rate
+    lr_decay_factor = 0.7  # Learning rate decay factor
+    lr_threshold = 1e-3  # Loss change threshold
+
+    meta_optimizer = optim.AdamW(model.parameters(), lr=meta_lr)
+    criterion_task = nn.SmoothL1Loss()
+
+    # ITP-MAML meta-training phase
+    print("ITP-MAML Training on source domain...")
+    maml_train(model, source_loader, meta_optimizer, criterion_task, noise_scale, initial_inner_lr, inner_steps, epochs=13, lr_decay_factor=lr_decay_factor, lr_threshold=lr_threshold)

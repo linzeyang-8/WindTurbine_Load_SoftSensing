@@ -1,0 +1,558 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from catboost import CatBoostRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+import os
+
+
+# Define Multi-Layer Perceptron model
+class MLP(nn.Module):
+    def __init__(self, input_size, hidden_sizes, dropout_rate):
+        super(MLP, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_sizes[0])
+        self.dropout1 = nn.Dropout(dropout_rate)
+        self.fc2 = nn.Linear(hidden_sizes[0], hidden_sizes[1])
+        self.prelu = nn.PReLU()
+        self.dropout2 = nn.Dropout(dropout_rate)
+        self.fc3 = nn.Linear(hidden_sizes[1], hidden_sizes[2])
+        self.dropout3 = nn.Dropout(dropout_rate)
+        self.fc4 = nn.Linear(hidden_sizes[2], 1)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.dropout1(x)
+        x = self.fc2(x)
+        x = self.prelu(x)
+        x = self.dropout2(x)
+        x = self.fc3(x)
+        x = self.prelu(x)
+        x = self.dropout3(x)
+        x = self.fc4(x)
+        return x
+
+
+# Train MLP model
+def train_mlp_model(mlp_model, X_train_tensor, y_train_tensor, hyperparameters):
+    dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    loader = DataLoader(dataset, batch_size=hyperparameters['batch_size'], shuffle=True)
+    optimizer = optim.AdamW(mlp_model.parameters(), lr=hyperparameters['lr'])
+    criterion = nn.SmoothL1Loss()
+
+    for epoch in range(hyperparameters['num_epochs']):
+        mlp_model.train()
+        running_loss = 0.0
+        for batch_X, batch_y in loader:
+            optimizer.zero_grad()
+            outputs = mlp_model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        print(f'Epoch {epoch + 1}, Loss: {running_loss / len(loader)}')
+    return mlp_model
+
+
+# Evaluate model performance
+def evaluate_model(y_true, y_pred):
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    return mse, rmse, mae, r2
+
+
+# Data standardization (adapted for 3 test sets)
+def standardize_data(X_train, X_test, X_test_noisy_10, X_test_noisy_20):
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    X_test_noisy_10_scaled = scaler.transform(X_test_noisy_10)
+    X_test_noisy_20_scaled = scaler.transform(X_test_noisy_20)
+    return X_train_scaled, X_test_scaled, X_test_noisy_10_scaled, X_test_noisy_20_scaled
+
+
+# Train and evaluate model (adapted for 3 test sets)
+def train_and_evaluate(X_train, X_test, X_test_noisy_10, X_test_noisy_20,
+                       y_train, y_test, param_grid, mlp_hyperparameters):
+    # Data standardization (adapted for 3 test sets)
+    X_train_scaled, X_test_scaled, X_test_noisy_10_scaled, X_test_noisy_20_scaled = standardize_data(
+        X_train, X_test, X_test_noisy_10, X_test_noisy_20
+    )
+
+    mse_scores = []
+    rmse_scores = []
+    mae_scores = []
+    r2_scores = []
+    # Add result storage for 3 test sets
+    test_r2_scores = []
+    test_noisy_10_r2_scores = []
+    test_noisy_20_r2_scores = []
+    y_pred_test_list = []
+    y_pred_test_noisy_10_list = []
+    y_pred_test_noisy_20_list = []
+
+    kf = KFold(n_splits=3, shuffle=True, random_state=42)
+
+    for fold, (train_index, val_index) in enumerate(kf.split(X_train_scaled)):
+        print(f'Processing fold {fold + 1}')
+
+        # Split into training and validation sets
+        X_train_fold = X_train_scaled[train_index]
+        y_train_fold = y_train.iloc[train_index]
+        X_val_fold = X_train_scaled[val_index]
+        y_val_fold = y_train.iloc[val_index]
+
+        # Train CatBoost model
+        print('Training CatBoost model...')
+        regressor = CatBoostRegressor(**param_grid, verbose=0, random_state=42)
+        regressor.fit(X_train_fold, y_train_fold)
+
+        # Get CatBoost prediction results (adapted for 3 test sets)
+        catboost_pred_train = regressor.predict(X_train_fold).reshape(-1, 1)
+        catboost_pred_val = regressor.predict(X_val_fold).reshape(-1, 1)
+        catboost_pred_test = regressor.predict(X_test_scaled).reshape(-1, 1)
+        catboost_pred_test_noisy_10 = regressor.predict(X_test_noisy_10_scaled).reshape(-1, 1)
+        catboost_pred_test_noisy_20 = regressor.predict(X_test_noisy_20_scaled).reshape(-1, 1)
+
+        # Use CatBoost predictions as new features (adapted for 3 test sets)
+        X_train_new = np.hstack((X_train_fold, catboost_pred_train))
+        X_val_new = np.hstack((X_val_fold, catboost_pred_val))
+        X_test_new = np.hstack((X_test_scaled, catboost_pred_test))
+        X_test_noisy_10_new = np.hstack((X_test_noisy_10_scaled, catboost_pred_test_noisy_10))
+        X_test_noisy_20_new = np.hstack((X_test_noisy_20_scaled, catboost_pred_test_noisy_20))
+
+        # Convert data to PyTorch tensors
+        X_train_tensor = torch.tensor(X_train_new, dtype=torch.float32)
+        y_train_tensor = torch.tensor(y_train_fold.values.reshape(-1, 1), dtype=torch.float32)
+        X_val_tensor = torch.tensor(X_val_new, dtype=torch.float32)
+        X_test_tensor = torch.tensor(X_test_new, dtype=torch.float32)
+        X_test_noisy_10_tensor = torch.tensor(X_test_noisy_10_new, dtype=torch.float32)
+        X_test_noisy_20_tensor = torch.tensor(X_test_noisy_20_new, dtype=torch.float32)
+
+        torch.manual_seed(42)
+
+        # Initialize MLP model
+        mlp_model = MLP(X_train_tensor.shape[1], mlp_hyperparameters['MLP_hidden_sizes'],
+                        mlp_hyperparameters['dropout_rate'])
+
+        # Train MLP model
+        print('Training MLP model...')
+        mlp_model = train_mlp_model(mlp_model, X_train_tensor, y_train_tensor, mlp_hyperparameters)
+
+        # Predict on validation set and 3 test sets
+        mlp_model.eval()
+        with torch.no_grad():
+            y_pred_val = mlp_model(X_val_tensor).numpy().flatten()
+            y_pred_test = mlp_model(X_test_tensor).numpy().flatten()
+            y_pred_test_noisy_10 = mlp_model(X_test_noisy_10_tensor).numpy().flatten()
+            y_pred_test_noisy_20 = mlp_model(X_test_noisy_20_tensor).numpy().flatten()
+
+        # Record validation set evaluation results
+        mse, rmse, mae, r2 = evaluate_model(y_val_fold, y_pred_val)
+        mse_scores.append(mse)
+        rmse_scores.append(rmse)
+        mae_scores.append(mae)
+        r2_scores.append(r2)
+
+        # Record predictions and R2 scores for 3 test sets
+        y_pred_test_list.append(y_pred_test)
+        y_pred_test_noisy_10_list.append(y_pred_test_noisy_10)
+        y_pred_test_noisy_20_list.append(y_pred_test_noisy_20)
+
+        _, _, _, test_r2 = evaluate_model(y_test, y_pred_test)
+        _, _, _, test_noisy_10_r2 = evaluate_model(y_test, y_pred_test_noisy_10)
+        _, _, _, test_noisy_20_r2 = evaluate_model(y_test, y_pred_test_noisy_20)
+
+        test_r2_scores.append(test_r2)
+        test_noisy_10_r2_scores.append(test_noisy_10_r2)
+        test_noisy_20_r2_scores.append(test_noisy_20_r2)
+
+    # Calculate average predictions for 3 test sets
+    y_pred_test_mean = np.mean(y_pred_test_list, axis=0)
+    y_pred_test_noisy_10_mean = np.mean(y_pred_test_noisy_10_list, axis=0)
+    y_pred_test_noisy_20_mean = np.mean(y_pred_test_noisy_20_list, axis=0)
+
+    # Calculate final metrics for 3 test sets
+    mse_test, rmse_test, mae_test, r2_test = evaluate_model(y_test, y_pred_test_mean)
+    mse_noisy_10, rmse_noisy_10, mae_noisy_10, r2_noisy_10 = evaluate_model(y_test, y_pred_test_noisy_10_mean)
+    mse_noisy_20, rmse_noisy_20, mae_noisy_20, r2_noisy_20 = evaluate_model(y_test, y_pred_test_noisy_20_mean)
+
+    return {
+        # Validation set results
+        'mse_scores': mse_scores,
+        'rmse_scores': rmse_scores,
+        'mae_scores': mae_scores,
+        'r2_scores': r2_scores,
+        # Full test set results
+        'y_pred_test': y_pred_test_mean,
+        'test_mse': mse_test,
+        'test_rmse': rmse_test,
+        'test_mae': mae_test,
+        'test_r2': r2_test,
+        'test_r2_scores': test_r2_scores,
+        # 10% noisy test set results
+        'y_pred_test_noisy_10': y_pred_test_noisy_10_mean,
+        'test_noisy_10_mse': mse_noisy_10,
+        'test_noisy_10_rmse': rmse_noisy_10,
+        'test_noisy_10_mae': mae_noisy_10,
+        'test_noisy_10_r2': r2_noisy_10,
+        'test_noisy_10_r2_scores': test_noisy_10_r2_scores,
+        # 20% noisy test set results
+        'y_pred_test_noisy_20': y_pred_test_noisy_20_mean,
+        'test_noisy_20_mse': mse_noisy_20,
+        'test_noisy_20_rmse': rmse_noisy_20,
+        'test_noisy_20_mae': mae_noisy_20,
+        'test_noisy_20_r2': r2_noisy_20,
+        'test_noisy_20_r2_scores': test_noisy_20_r2_scores
+    }
+
+
+def load_data():
+    data_files = {
+        'train': r"E:\Codes_and_datasets\Dimensionality_reduction_file\5MW-Different_DR_models\X_train_encoded_GVAM-RN.xlsx",
+        'test': r"E:\Codes_and_datasets\Dimensionality_reduction_file\5MW-Different_DR_models\X_test_encoded_GVAM-RN.xlsx",  # Full test set
+        'test_noisy_10%': r"E:\Codes_and_datasets\Dimensionality_reduction_file\SF5MW_encoded_10_Test(3-10%).xlsx",
+        'test_noisy_20%': r"E:\Codes_and_datasets\Dimensionality_reduction_file\SF5MW_encoded_10_Test(3-20%).xlsx"
+    }
+
+    try:
+        # Load training set
+        X_train = pd.read_excel(data_files['train'])
+        # Load 3 test sets
+        X_test = pd.read_excel(data_files['test'])
+        X_test_noisy_10 = pd.read_excel(data_files['test_noisy_10%'])
+        X_test_noisy_20 = pd.read_excel(data_files['test_noisy_20%'])
+
+        print(f"Loaded GVAM-Rn training set successfully, shape: {X_train.shape}")
+        print(f"Loaded full test set successfully, shape: {X_test.shape}")
+        print(f"Loaded 10% noisy test set successfully, shape: {X_test_noisy_10.shape}")
+        print(f"Loaded 20% noisy test set successfully, shape: {X_test_noisy_20.shape}")
+
+        return X_train, X_test, X_test_noisy_10, X_test_noisy_20
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return None, None, None, None
+
+
+def plot_combined_figures(y_true_delmt, y_pred_delmt_full, y_pred_delmt_noisy_10, y_pred_delmt_noisy_20,
+                          y_true_delts, y_pred_delts_full, y_pred_delts_noisy_10, y_pred_delts_noisy_20,
+                          delmt_r2_dict, delts_r2_dict,
+                          save_path=None, figsize=(16, 12)):
+
+    # Global font and layout parameters
+    plt.rcParams.update({
+        'font.family': 'serif',
+        'mathtext.fontset': 'stix',
+        'font.size': 22,
+        'axes.labelsize': 24,
+        'axes.titlesize': 26,
+        'legend.fontsize': 16,
+        'xtick.labelsize': 25,
+        'ytick.labelsize': 25,
+        'figure.titlesize': 26,
+        'text.usetex': False,
+    })
+
+    # Create 2 rows × 1 column subplots (2 targets in 1 figure)
+    fig, axs = plt.subplots(
+        2, 1,
+        figsize=figsize,
+        gridspec_kw={'hspace': 0.6}  # Increase subplot spacing to avoid legend overlap
+    )
+    subplot_labels = ['(a)', '(b)']  # (a) DELMt, (b) DELTs
+    target_names = [r"${\it DEL}_{\rm Mt}$", r"${\it DEL}_{\rm Ts}$"]
+    # Prediction labels (unified triangle markers)
+    pred_labels = [
+        'Test Set',
+        '10% Noisy',
+        '20% Noisy'
+    ]
+    # Color scheme remains unchanged, only markers unified
+    colors = ['blue', 'green', 'orange']
+
+    # -------------------------- Subplot 1: DELMt (adjust R² text position to x-axis 4-8 range) --------------------------
+    ax = axs[0]
+    index = range(len(y_true_delmt))
+
+    # True value: pentagram marker
+    ax.plot(index, y_true_delmt, color='red', marker='*', label='True Value',
+            linewidth=2.5, markersize=10, alpha=0.8)
+
+    # 3 prediction lines: unified triangle markers
+    # Blue line (Test Set): bold + high transparency + unique marker
+    ax.plot(index, y_pred_delmt_full, color=colors[0], marker='^', label=pred_labels[0],
+            linewidth=3, alpha=0.9, markersize=9)
+    # Green line (10% Noisy): thinner + lower transparency + different marker
+    ax.plot(index, y_pred_delmt_noisy_10, color=colors[1], marker='s', label=pred_labels[1],
+            linewidth=2, alpha=0.7, markersize=8)
+    # Orange line (20% Noisy): keep original style
+    ax.plot(index, y_pred_delmt_noisy_20, color=colors[2], marker='d', label=pred_labels[2],
+            linewidth=2.5, alpha=0.8, markersize=8)
+
+    # Adjust R² text position: x-axis 4-8 corresponds to relative coordinate ~0.55-0.8, arranged vertically in lower area
+    r2_texts = [
+        f'Test Set R²: {delmt_r2_dict["full"]:.4f}',
+        f'10% Noisy R²: {delmt_r2_dict["noisy_10"]:.4f}',
+        f'20% Noisy R²: {delmt_r2_dict["noisy_20"]:.4f}'
+    ]
+    for i, text in enumerate(r2_texts):
+        ax.text(0.55, 0.3 - i * 0.12, text, transform=ax.transAxes,
+                fontsize=18, color=colors[i], fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+
+    # Subplot configuration
+    ax.set_title(f'Estimated and True Value Comparison of {target_names[0]} (GVAM-Rn)', fontsize=26)
+    ax.set_xlabel('Number of Test Samples', fontsize=24)
+    ax.set_ylabel(f'{target_names[0]} (N·m)', fontsize=24)
+    ax.legend(loc='lower right', fontsize=16, framealpha=0.9)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.text(0.5, -0.3, subplot_labels[0], transform=ax.transAxes, ha='center', va='top', fontsize=22)
+
+    # -------------------------- Subplot 2: DELTs (adjust R² text position to x-axis 4-8 range) --------------------------
+    ax = axs[1]
+    index = range(len(y_true_delts))
+
+    # True value: pentagram marker
+    ax.plot(index, y_true_delts, color='red', marker='*', label='True Value',
+            linewidth=2.5, markersize=10, alpha=0.8)
+
+    # 3 prediction lines: unified triangle markers
+    # Blue line (Test Set): bold + high transparency + unique marker
+    ax.plot(index, y_pred_delts_full, color=colors[0], marker='^', label=pred_labels[0],
+            linewidth=3, alpha=0.9, markersize=9)
+    # Green line (10% Noisy): thinner + lower transparency + different marker
+    ax.plot(index, y_pred_delts_noisy_10, color=colors[1], marker='s', label=pred_labels[1],
+            linewidth=2, alpha=0.7, markersize=8)
+    # Orange line (20% Noisy): keep original style
+    ax.plot(index, y_pred_delts_noisy_20, color=colors[2], marker='d', label=pred_labels[2],
+            linewidth=2.5, alpha=0.8, markersize=8)
+
+    # Adjust R² text position: x-axis 4-8 corresponds to relative coordinate ~0.55-0.8, arranged vertically in lower area
+    r2_texts = [
+        f'Test Set R²: {delts_r2_dict["full"]:.4f}',
+        f'10% Noisy R²: {delts_r2_dict["noisy_10"]:.4f}',
+        f'20% Noisy R²: {delts_r2_dict["noisy_20"]:.4f}'
+    ]
+    for i, text in enumerate(r2_texts):
+        ax.text(0.55, 0.3 - i * 0.12, text, transform=ax.transAxes,
+                fontsize=18, color=colors[i], fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+
+    # Subplot configuration
+    ax.set_title(f'Estimated and True Value Comparison of {target_names[1]} (GVAM-Rn)', fontsize=26)
+    ax.set_xlabel('Number of Test Samples', fontsize=24)
+    ax.set_ylabel(f'{target_names[1]} (N·m)', fontsize=24)
+    ax.legend(loc='lower right', fontsize=16, framealpha=0.9)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.text(0.5, -0.3, subplot_labels[1], transform=ax.transAxes, ha='center', va='top', fontsize=22)
+
+    # Adjust margins to ensure legends and labels are not cut off
+    plt.subplots_adjust(left=0.15, right=0.95, top=0.92, bottom=0.15)
+
+    if save_path:
+        save_dir = os.path.dirname(save_path)
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        plt.savefig(save_path, format='svg', dpi=300, bbox_inches='tight')
+        print(f"Figure saved to {save_path}")
+
+    plt.show()
+    plt.close()
+
+
+def print_combined_evaluation_results(delmt_results, delts_results):
+    print(f"\n{'=' * 100}")
+    print(f"Combined Evaluation Results (GVAM-Rn Model) - Robustness Verification (10%/20% Noisy Values)")
+    print(f"{'=' * 100}")
+
+    # Define target names
+    delmt_name = r"${\it DEL}_{\rm Mt}$"
+    delts_name = r"${\it DEL}_{\rm Ts}$"
+
+    # Print DELMt results
+    print(f"\n【Target: {delmt_name}】")
+    print(f"{'=' * 50}")
+    print("Validation Set Performance:")
+    # Calculate mean and standard deviation in advance to avoid f-string bracket nesting
+    delmt_mse_mean = np.mean(delmt_results['mse_scores'])
+    delmt_mse_std = np.std(delmt_results['mse_scores'])
+    delmt_rmse_mean = np.mean(delmt_results['rmse_scores'])
+    delmt_rmse_std = np.std(delmt_results['rmse_scores'])
+    delmt_mae_mean = np.mean(delmt_results['mae_scores'])
+    delmt_mae_std = np.std(delmt_results['mae_scores'])
+    delmt_r2_mean = np.mean(delmt_results['r2_scores'])
+    delmt_r2_std = np.std(delmt_results['r2_scores'])
+
+    print(f"MSE: {delmt_mse_mean:.4f} ± {delmt_mse_std:.4f}")
+    print(f"RMSE: {delmt_rmse_mean:.4f} ± {delmt_rmse_std:.4f}")
+    print(f"MAE: {delmt_mae_mean:.4f} ± {delmt_mae_std:.4f}")
+    print(f"R2: {delmt_r2_mean:.4f} ± {delmt_r2_std:.4f}")
+
+    print("\nFull Test Set Performance:")
+    print(
+        f"MSE: {delmt_results['test_mse']:.4f} | RMSE: {delmt_results['test_rmse']:.4f} | MAE: {delmt_results['test_mae']:.4f} | R2: {delmt_results['test_r2']:.4f} ± {np.std(delmt_results['test_r2_scores']):.4f}")
+
+    print("\n10% Noisy Test Set Performance:")
+    print(
+        f"MSE: {delmt_results['test_noisy_10_mse']:.4f} | RMSE: {delmt_results['test_noisy_10_rmse']:.4f} | MAE: {delmt_results['test_noisy_10_mae']:.4f} | R2: {delmt_results['test_noisy_10_r2']:.4f} ± {np.std(delmt_results['test_noisy_10_r2_scores']):.4f}")
+
+    print("\n20% Noisy Test Set Performance:")
+    print(
+        f"MSE: {delmt_results['test_noisy_20_mse']:.4f} | RMSE: {delmt_results['test_noisy_20_rmse']:.4f} | MAE: {delmt_results['test_noisy_20_mae']:.4f} | R2: {delmt_results['test_noisy_20_r2']:.4f} ± {np.std(delmt_results['test_noisy_20_r2_scores']):.4f}")
+
+    # Print DELTs results (compact connection)
+    print(f"\n【Target: {delts_name}】")
+    print(f"{'=' * 50}")
+    print("Validation Set Performance:")
+    # Calculate mean and standard deviation in advance to avoid f-string bracket nesting (fix error line)
+    delts_mse_mean = np.mean(delts_results['mse_scores'])
+    delts_mse_std = np.std(delts_results['mse_scores'])
+    delts_rmse_mean = np.mean(delts_results['rmse_scores'])
+    delts_rmse_std = np.std(delts_results['rmse_scores'])
+    delts_mae_mean = np.mean(delts_results['mae_scores'])
+    delts_mae_std = np.std(delts_results['mae_scores'])
+    delts_r2_mean = np.mean(delts_results['r2_scores'])
+    delts_r2_std = np.std(delts_results['r2_scores'])
+
+    print(f"MSE: {delts_mse_mean:.4f} ± {delts_mse_std:.4f}")
+    print(f"RMSE: {delts_rmse_mean:.4f} ± {delts_rmse_std:.4f}")
+    print(f"MAE: {delts_mae_mean:.4f} ± {delts_mae_std:.4f}")
+    print(f"R2: {delts_r2_mean:.4f} ± {delts_r2_std:.4f}")
+
+    print("\nFull Test Set Performance:")
+    print(
+        f"MSE: {delts_results['test_mse']:.4f} | RMSE: {delts_results['test_rmse']:.4f} | MAE: {delts_results['test_mae']:.4f} | R2: {delts_results['test_r2']:.4f} ± {np.std(delts_results['test_r2_scores']):.4f}")
+
+    print("\n10% Noisy Test Set Performance:")
+    print(
+        f"MSE: {delts_results['test_noisy_10_mse']:.4f} | RMSE: {delts_results['test_noisy_10_rmse']:.4f} | MAE: {delts_results['test_noisy_10_mae']:.4f} | R2: {delts_results['test_noisy_10_r2']:.4f} ± {np.std(delts_results['test_noisy_10_r2_scores']):.4f}")
+
+    print("\n20% Noisy Test Set Performance:")
+    print(
+        f"MSE: {delts_results['test_noisy_20_mse']:.4f} | RMSE: {delts_results['test_noisy_20_rmse']:.4f} | MAE: {delts_results['test_noisy_20_mae']:.4f} | R2: {delts_results['test_noisy_20_r2']:.4f} ± {np.std(delts_results['test_noisy_20_r2_scores']):.4f}")
+
+    print(f"\n{'=' * 100}")
+    # Add Robustness Analysis Summary
+    print(f"\nRobustness Analysis Summary:")
+    delmt_r2_drop_10 = delmt_results['test_r2'] - delmt_results['test_noisy_10_r2']
+    delmt_r2_drop_20 = delmt_results['test_r2'] - delmt_results['test_noisy_20_r2']
+    delts_r2_drop_10 = delts_results['test_r2'] - delts_results['test_noisy_10_r2']
+    delts_r2_drop_20 = delts_results['test_r2'] - delts_results['test_noisy_20_r2']
+
+    print(f"{delmt_name}: Full Test Set R2 → 10% Noisy R2 drop {delmt_r2_drop_10:.4f}, → 20% Noisy R2 drop {delmt_r2_drop_20:.4f}")
+    print(f"{delts_name}: Full Test Set R2 → 10% Noisy R2 drop {delts_r2_drop_10:.4f}, → 20% Noisy R2 drop {delts_r2_drop_20:.4f}")
+    print(f"Note: The smaller the R2 drop, the stronger the model's robustness")
+
+
+def main():
+    hyperparameters = {
+        # CatBoost parameter list
+        'param_grid_DELMt1': {
+            'depth': 3,
+            'iterations': 100,
+            'learning_rate': 0.29,
+            'l2_leaf_reg': 5,
+            'border_count': 260,
+            'loss_function': 'MAE'
+        },
+        'param_grid_DELTs1': {
+            'depth': 3,
+            'iterations': 210,
+            'learning_rate': 0.01,
+            'l2_leaf_reg': 2,
+            'border_count': 260,
+            'loss_function': 'RMSE'
+        },
+        # MLP parameter list
+        'DELMt': {
+            'MLP_hidden_sizes': [2025, 512, 128],
+            'dropout_rate': 0.8,
+            'batch_size': 128,
+            'lr': 2e-5,
+            'num_epochs': 20
+        },
+        'DELTs': {
+            'MLP_hidden_sizes': [2025, 512, 128],
+            'dropout_rate': 0.02,
+            'batch_size': 300,
+            'lr': 2e-6,
+            'num_epochs': 10
+        },
+    }
+
+    # Load target variables
+    try:
+        print('Loading target variables...')
+        # Training set target variables
+        targets_train = pd.read_excel(r"E:\Codes_and_datasets\Datasets\48000-Training_data-DEL.xlsx")
+        y_DELMt_train = targets_train['DELMt']
+        y_DELTs_train = targets_train['DELTs']
+
+        # Test set target variables (3 test sets share the same true values)
+        targets_test = pd.read_excel(r"E:\Codes_and_datasets\Datasets\10-Test_data-DEL.xlsx")
+        y_DELMt_test = targets_test['DELMt']
+        y_DELTs_test = targets_test['DELTs']
+        print('Target variables loaded successfully.')
+    except Exception as e:
+        print(f'Error loading target variables: {e}')
+        return
+
+    # Load GVAM-Rn training set and 3 test sets
+    X_train, X_test, X_test_noisy_10, X_test_noisy_20 = load_data()
+    if X_train is None:
+        return
+
+    # Process DELMt task (3 test sets)
+    print("\nProcessing DELMt...")
+    delmt_results = train_and_evaluate(
+        X_train, X_test, X_test_noisy_10, X_test_noisy_20,
+        y_DELMt_train, y_DELMt_test,
+        hyperparameters['param_grid_DELMt1'], hyperparameters['DELMt']
+    )
+
+    # Process DELTs task (3 test sets)
+    print("\nProcessing DELTs...")
+    delts_results = train_and_evaluate(
+        X_train, X_test, X_test_noisy_10, X_test_noisy_20,
+        y_DELTs_train, y_DELTs_test,
+        hyperparameters['param_grid_DELTs1'], hyperparameters['DELTs']
+    )
+
+    # Print compact evaluation results for both targets (including robustness analysis)
+    print_combined_evaluation_results(delmt_results, delts_results)
+
+    # -------------------------- Core Modification: Create R² dictionaries, add noise parameters --------------------------
+    # R² dictionary for DELMt (corresponding to Full Test Set, 10% Noisy, 20% Noisy)
+    delmt_r2_dict = {
+        'full': delmt_results['test_r2'],
+        'noisy_10': delmt_results['test_noisy_10_r2'],
+        'noisy_20': delmt_results['test_noisy_20_r2']
+    }
+    # R² dictionary for DELTs
+    delts_r2_dict = {
+        'full': delts_results['test_r2'],
+        'noisy_10': delts_results['test_noisy_10_r2'],
+        'noisy_20': delts_results['test_noisy_20_r2']
+    }
+
+    # Plot combined figure (2 targets, each subplot with 4 curves: true value + 3 predictions)
+    plot_combined_figures(
+        y_DELMt_test, delmt_results['y_pred_test'], delmt_results['y_pred_test_noisy_10'],
+        delmt_results['y_pred_test_noisy_20'],
+        y_DELTs_test, delts_results['y_pred_test'], delts_results['y_pred_test_noisy_10'],
+        delts_results['y_pred_test_noisy_20'],
+        delmt_r2_dict,
+        delts_r2_dict,
+        save_path=r'E:\Codes_and_datasets\pictures\Comparison_of_5MW_noisy_test_set.svg'
+    )
+
+
+if __name__ == "__main__":
+    main()

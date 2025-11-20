@@ -1,0 +1,685 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import logging
+import random
+import math
+import os
+from tabulate import tabulate
+
+# Configure logging (only keep key information)
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# -------------------------- Core Configuration: Global Font + Fixed Parameters --------------------------
+plt.rcParams.update({
+    'font.family': ['SimHei', 'Microsoft YaHei', 'SimSun', 'FangSong', 'STSong', 'serif'],
+    'axes.unicode_minus': False,
+    'mathtext.fontset': 'stix',
+    'mathtext.default': 'it',
+    'font.size': 20,
+    'axes.labelsize': 22,
+    'axes.titlesize': 24,
+    'legend.fontsize': 14,
+    'xtick.labelsize': 20,
+    'ytick.labelsize': 20,
+    'text.usetex': False
+})
+
+# ITP-MAML Specific Parameters
+FIXED_TASK_PARAMS = {
+    'common': {
+        'seed': 42,
+        'hidden_dims': [2024, 512, 128],
+        'pth_itp': r'E:\Codes_and_datasets\Model_weights\ITP-MAML.pth'
+    },
+    'ITP-MAML': {
+        'DEL_Mt': {
+            'num_steps': 3,
+            'dropout_rate': 0.25,
+            'prelu_init': 0.9,
+            'epochs_per_step': 100,
+            'lr_feat': 0.0002,
+            'lr_out': 0.002,
+            'batch_size': 50
+        },
+        'DEL_Ts': {
+            'num_steps': 3,
+            'dropout_rate': 0.2,
+            'prelu_init': 0.3,
+            'epochs_per_step': 50,
+            'lr_feat': 0.001,
+            'lr_out': 1e-05,
+            'batch_size': 30
+        },
+        'DEL_Rm': {
+            'dropout_rate': 0.25,
+            'prelu_init': 0.9,
+            'batch_size': 50,
+            'epochs_per_step': 100,
+            'num_steps': 2,
+            'lr_feat': 0.002,
+            'lr_out': 0.025,
+        },
+        'DEL_Yb': {
+            'dropout_rate': 0.2,
+            'prelu_init': 0.92,
+            'batch_size': 50,
+            'epochs_per_step': 100,
+            'num_steps': 2,
+            'lr_feat': 0.002,
+            'lr_out': 0.025,
+        }
+    }
+}
+
+
+# -------------------------- 1. Global Utility Functions --------------------------
+def set_random_seed(seed):
+    """Fix all random seeds to ensure 100% reproducibility"""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    """Set random seed for data loader workers"""
+    worker_seed = torch.initial_seed() % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def create_data_loaders(dataset, batch_size, shuffle=True):
+    """Create data loader with fixed seed for reproducibility"""
+    generator = torch.Generator().manual_seed(42)
+    return DataLoader(
+        dataset, batch_size=batch_size, shuffle=shuffle,
+        worker_init_fn=seed_worker, generator=generator
+    )
+
+
+def load_pth_file(file_path):
+    """Load pre-trained model parameters"""
+    try:
+        saved_state_dict = torch.load(file_path, weights_only=True)
+        print(f"\n{file_path} Pre-trained parameters preview (first 5):")
+        for key, value in list(saved_state_dict.items())[:5]:
+            print(f"Key: {key}, Shape: {value.shape}")
+        return saved_state_dict
+    except FileNotFoundError:
+        print(f"⚠️ Pre-trained file not found: {file_path}, using random initialization")
+        return None
+    except Exception as e:
+        print(f"Error loading pre-trained file: {e}")
+        return None
+
+
+def load_data_15mw(sample_size=50):
+    """Load 1.5MW dataset (supports different sample sizes)"""
+    # Select corresponding files based on sample size
+    sample_files = {
+        20: {
+            'X_train': r"E:\Codes_and_datasets\Dimensionality_reduction_file\OP1.5MW_encoded_20_Train.xlsx",
+            'y_train': r'E:\Codes_and_datasets\Datasets\1.5MW\OP1.5MW_targets_20_Train.xlsx'
+        },
+        30: {
+            'X_train': r"E:\Codes_and_datasets\Dimensionality_reduction_file\OP1.5MW_encoded_30_Train.xlsx",
+            'y_train': r'E:\Codes_and_datasets\Datasets\1.5MW\OP1.5MW_targets_30_Train.xlsx'
+        },
+        50: {
+            'X_train': r"E:\Codes_and_datasets\Dimensionality_reduction_file\OP1.5MW_encoded_50_Train.xlsx",
+            'y_train': r'E:\Codes_and_datasets\Datasets\1.5MW\OP1.5MW_targets_50_Train.xlsx'
+        },
+        70: {
+            'X_train': r"E:\Codes_and_datasets\Dimensionality_reduction_file\OP1.5MW_encoded_70_Train.xlsx",
+            'y_train': r'E:\Codes_and_datasets\Datasets\1.5MW\OP1.5MW_targets_70_Train.xlsx'
+        }
+    }
+
+    # Fixed test set file paths
+    X_path_test = r"E:\Codes_and_datasets\Dimensionality_reduction_file\OP1.5MW_encoded_10_Test.xlsx"
+    y_path_test = r'E:\Codes_and_datasets\Datasets\1.5MW\OP1.5MW_targets_10_Test.xlsx'
+
+    if sample_size not in sample_files:
+        raise ValueError(f"Unsupported sample size: {sample_size}, supported sizes: 20, 30, 50, 70")
+
+    X_path_train = sample_files[sample_size]['X_train']
+    y_path_train = sample_files[sample_size]['y_train']
+
+    # Check file existence
+    file_paths = [
+        (X_path_train, f"Training set features file ({sample_size} samples)"),
+        (y_path_train, f"Training set targets file ({sample_size} samples)"),
+        (X_path_test, "Test set features file"),
+        (y_path_test, "Test set targets file")
+    ]
+
+    for path, file_desc in file_paths:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"❌ {file_desc} does not exist: {path}")
+
+    # Load data
+    print(f"Loading 1.5MW dataset ({sample_size} samples)...")
+    X_train_df = pd.read_excel(X_path_train).reset_index(drop=True)
+    y_train_df = pd.read_excel(y_path_train).reset_index(drop=True)
+    X_test_df = pd.read_excel(X_path_test).reset_index(drop=True)
+    y_test_df = pd.read_excel(y_path_test).reset_index(drop=True)
+
+    # Verify data consistency
+    if len(X_train_df) != len(y_train_df):
+        raise ValueError(f"❌ Mismatched rows: Training set features ({len(X_train_df)} rows) vs targets ({len(y_train_df)} rows)")
+    if len(X_test_df) != len(y_test_df):
+        raise ValueError(f"❌ Mismatched rows: Test set features ({len(X_test_df)} rows) vs targets ({len(y_test_df)} rows)")
+
+    # Convert to numpy arrays
+    X_train = X_train_df.values.astype(np.float32)
+    X_test = X_test_df.values.astype(np.float32)
+
+    # Extract target variables for each task
+    def get_target_data(df, col_name):
+        if col_name not in df.columns:
+            raise KeyError(f"❌ Column not found in targets file: {col_name}")
+        return df[col_name].values.astype(np.float32).reshape(-1, 1)
+
+    y_train = {
+        "DEL_Mt": get_target_data(y_train_df, 'DELMt'),
+        "DEL_Ts": get_target_data(y_train_df, 'DELTs'),
+        "DEL_Rm": get_target_data(y_train_df, 'DELRm'),
+        "DEL_Yb": get_target_data(y_train_df, 'DELYb')
+    }
+    y_test_original = {
+        "DEL_Mt": get_target_data(y_test_df, 'DELMt'),
+        "DEL_Ts": get_target_data(y_test_df, 'DELTs'),
+        "DEL_Rm": get_target_data(y_test_df, 'DELRm'),
+        "DEL_Yb": get_target_data(y_test_df, 'DELYb')
+    }
+
+    print(f"\n{'=' * 80}")
+    print(f"1.5MW Dataset Loading Results ({sample_size} samples):")
+    print(f"Training set: {len(X_train_df)} samples")
+    print(f"Test set: {len(X_test_df)} samples")
+    print(f"{'=' * 80}")
+
+    return X_train, y_train, X_test, y_test_original
+
+
+# -------------------------- 2. Model Definition --------------------------
+class ResidualBlockTask(nn.Module):
+    def __init__(self, dim, dropout_rate, prelu_init):
+        super().__init__()
+        self.depthwise = nn.Conv1d(dim, dim, kernel_size=1, groups=dim)
+        self.pointwise = nn.Conv1d(dim, dim, kernel_size=1)
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(dim, dim // 4, 1),
+            nn.ReLU(),
+            nn.Conv1d(dim // 4, dim, 1),
+            nn.Sigmoid()
+        )
+        self.prelu = nn.PReLU(num_parameters=dim, init=prelu_init)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.ln = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        residual = x
+        x = x.unsqueeze(2)
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = x * self.se(x)
+        x = x.squeeze(2)
+        x = self.ln(x)
+        x = self.prelu(x)
+        x = self.dropout(x)
+        return x + residual  # Residual connection
+
+
+class MultiTaskModel(nn.Module):
+    def __init__(self, input_dim, hidden_dims, dropout_rate, prelu_init):
+        super().__init__()
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(input_dim, hidden_dims[0]),
+            nn.PReLU(num_parameters=hidden_dims[0], init=prelu_init),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dims[0], hidden_dims[1]),
+            nn.PReLU(num_parameters=hidden_dims[1], init=prelu_init),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dims[1], hidden_dims[2]),
+            nn.PReLU(num_parameters=hidden_dims[2], init=prelu_init),
+            nn.Dropout(dropout_rate)
+        )
+        self.task_classifier_DEL_Mt = nn.Sequential(ResidualBlockTask(hidden_dims[2], dropout_rate, prelu_init),
+                                                    nn.Linear(hidden_dims[2], 1))
+        self.task_classifier_DEL_Ts = nn.Sequential(ResidualBlockTask(hidden_dims[2], dropout_rate, prelu_init),
+                                                    nn.Linear(hidden_dims[2], 1))
+        self.task_classifier_DEL_Rm = nn.Sequential(ResidualBlockTask(hidden_dims[2], dropout_rate, prelu_init),
+                                                    nn.Linear(hidden_dims[2], 1))
+        self.task_classifier_DEL_Yb = nn.Sequential(ResidualBlockTask(hidden_dims[2], dropout_rate, prelu_init),
+                                                    nn.Linear(hidden_dims[2], 1))
+
+    def forward(self, x):
+        features = self.feature_extractor(x)
+        return (
+            self.task_classifier_DEL_Mt(features),
+            self.task_classifier_DEL_Ts(features),
+            self.task_classifier_DEL_Rm(features),
+            self.task_classifier_DEL_Yb(features)
+        )
+
+
+# -------------------------- 3. Core Training and Evaluation Functions --------------------------
+def load_pretrained_model(model, task_name, pth_path, prelu_init, method_name, current_task):
+    """Load pre-trained model parameters and map to current model structure"""
+    if not pth_path or not os.path.exists(pth_path):
+        print(f"⚠️ {method_name} does not load pre-trained parameters (no pth file), using random initialization")
+        return model
+
+    saved_dict = load_pth_file(pth_path)
+    if saved_dict:
+        model_dict = model.state_dict()
+        pretrained_dict = {}
+
+        for key, value in saved_dict.items():
+            # Process output_layer of MAML model
+            if "output_layer" in key:
+                task_dim_map = {
+                    "DEL_Mt": 0,
+                    "DEL_Ts": 1
+                }
+                if current_task not in task_dim_map:
+                    print(f"⚠️ MAML not trained on {current_task} task, skip loading output_layer parameters for this task")
+                    continue
+
+                dim_idx = task_dim_map[current_task]
+                if "weight" in key:
+                    new_key = f"task_classifier_{current_task}.1.weight"
+                    pretrained_dict[new_key] = value[dim_idx:dim_idx + 1, :]
+                elif "bias" in key:
+                    new_key = f"task_classifier_{current_task}.1.bias"
+                    pretrained_dict[new_key] = value[dim_idx:dim_idx + 1]
+                else:
+                    continue
+                print(f"Map MAML parameter: {key}[{dim_idx}] -> {new_key} (Shape: {pretrained_dict[new_key].shape})")
+
+            # Process feature extractor parameters
+            elif "feature_extractor" in key:
+                pretrained_dict[key] = value
+            elif "task_classifier" in key:
+                pretrained_dict[key] = value
+            else:
+                if key.startswith("0.") or key.startswith("1.") or key.startswith("2."):
+                    new_key = f"feature_extractor.{key}"
+                    pretrained_dict[new_key] = value
+
+        # Filter keys that exist in the current model
+        filtered_pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+
+        if not filtered_pretrained_dict:
+            print(f"⚠️ Pre-trained parameters do not match model structure, using random initialization")
+            return model
+
+        # Update model parameters
+        model_dict.update(filtered_pretrained_dict)
+
+        try:
+            model.load_state_dict(model_dict, strict=False)
+            print(f"✅ Successfully loaded {method_name} pre-trained parameters for {task_name} ({len(filtered_pretrained_dict)} parameters)")
+
+            # Reset PReLU parameters
+            for module in model.modules():
+                if isinstance(module, nn.PReLU):
+                    module.weight.data.fill_(prelu_init)
+
+        except Exception as e:
+            print(f"❌ Failed to load pre-trained parameters: {e}, using random initialization")
+
+    return model
+
+
+def progressive_fine_tune(model, train_loader, optimizer, criterion, task_params, method_name):
+    """Progressive fine-tuning: gradually increase data volume and unfreeze layers"""
+    set_random_seed(task_params['common']['seed'])
+    num_layers = len(model.feature_extractor) // 3
+    num_steps = task_params['task_specific']['num_steps']
+
+    for step in range(num_steps):
+        # Gradually increase data volume
+        subset_size = int(len(train_loader.dataset) * (step + 1) / num_steps)
+        subset_indices = torch.randperm(len(train_loader.dataset))[:subset_size]
+        subset_dataset = torch.utils.data.Subset(train_loader.dataset, subset_indices)
+        subset_loader = DataLoader(
+            subset_dataset,
+            batch_size=task_params['task_specific']['batch_size'],
+            shuffle=True
+        )
+
+        # Gradually unfreeze layers
+        num_unfreeze = (step + 1) * (num_layers // num_steps)
+
+        # Set parameter gradients
+        for i, layer in enumerate(model.feature_extractor):
+            for param in layer.parameters():
+                block_idx = i // 3
+                param.requires_grad = (block_idx < num_unfreeze)
+
+        # Fine-tuning training
+        for epoch in range(task_params['task_specific']['epochs_per_step']):
+            model.train()
+            total_loss = 0
+            batch_count = 0
+
+            for x, y in subset_loader:
+                y_preds = model(x)
+                y_pred = y_preds[task_params['current_task_idx']]
+                loss = criterion(y_pred, y)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+                batch_count += 1
+
+    return model
+
+
+def evaluate_ITPMAML_with_different_samples():
+    """Progressive experiment with different sample sizes using ITP-MAML method"""
+    print(f"\n{'=' * 100}")
+    print(f"ITP-MAML Method - Progressive Experiment with Different Sample Sizes")
+    print(f"{'=' * 100}")
+
+    # Fix global random seed
+    global_seed = FIXED_TASK_PARAMS['common']['seed']
+    set_random_seed(global_seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Define sample sizes and tasks
+    sample_sizes = [20, 30, 50, 70]
+    tasks = ["DEL_Mt", "DEL_Ts", "DEL_Rm", "DEL_Yb"]
+
+    # Store all results (including predictions)
+    all_results = {task: {} for task in tasks}
+    all_predictions = {task: {} for task in tasks}
+    img_dir = r"E:\Codes_and_datasets\pictures"
+    os.makedirs(img_dir, exist_ok=True)
+
+    # Target variable information
+    target_info_map = {
+        "DEL_Mt": {"plot_name": "$\\it{DEL}_{\\text{Mt}}$", "label": "$\\it{DEL}_{\\text{Mt}}$ (N·m)"},
+        "DEL_Ts": {"plot_name": "$\\it{DEL}_{\\text{Ts}}$", "label": "$\\it{DEL}_{\\text{Ts}}$ (N·m)"},
+        "DEL_Rm": {"plot_name": "$\\it{DEL}_{\\text{Rm}}$", "label": "$\\it{DEL}_{\\text{Rm}}$ (N·m)"},
+        "DEL_Yb": {"plot_name": "$\\it{DEL}_{\\text{Yb}}$", "label": "$\\it{DEL}_{\\text{Yb}}$ (N·m)"}
+    }
+
+    # Store test set true values (save only once)
+    y_test_true = {}
+
+    # Print ITP-MAML specific parameters
+    print(f"\n{'=' * 100}")
+    print(f"ITP-MAML Specific Parameters Summary")
+    print(f"{'=' * 100}")
+    for task in tasks:
+        print(f"\n  {task}:")
+        for key, value in FIXED_TASK_PARAMS['ITP-MAML'][task].items():
+            print(f"    {key}: {value}")
+
+    # Conduct experiments with different sample sizes
+    for sample_size in sample_sizes:
+        print(f"\n{'#' * 80}")
+        print(f"Starting experiment with {sample_size} samples")
+        print(f"{'#' * 80}")
+
+        # Load data
+        X_train, y_train, X_test, y_test_original = load_data_15mw(sample_size)
+
+        # Save test set true values (save only once)
+        if not y_test_true:
+            for task in tasks:
+                y_test_true[task] = y_test_original[task].flatten()
+
+        for task_idx, current_task in enumerate(tasks):
+            print(f"\nStarting {current_task} training ({sample_size} samples)")
+
+            # Get task-specific parameters
+            task_specific_params = FIXED_TASK_PARAMS['ITP-MAML'][current_task]
+
+            task_params = {
+                'common': FIXED_TASK_PARAMS['common'],
+                'task_specific': task_specific_params,
+                'current_task': current_task,
+                'current_task_idx': task_idx
+            }
+
+            # Data standardization
+            scaler_X = StandardScaler()
+            X_train_scaled = scaler_X.fit_transform(X_train)
+            X_test_scaled = scaler_X.transform(X_test)
+
+            scaler_y = StandardScaler()
+            y_train_scaled = scaler_y.fit_transform(y_train[current_task])
+            y_test_scaled = scaler_y.transform(y_test_original[current_task])
+
+            # Build datasets
+            train_dataset = TensorDataset(
+                torch.tensor(X_train_scaled, dtype=torch.float32),
+                torch.tensor(y_train_scaled, dtype=torch.float32)
+            )
+            test_dataset = TensorDataset(
+                torch.tensor(X_test_scaled, dtype=torch.float32),
+                torch.tensor(y_test_scaled, dtype=torch.float32)
+            )
+
+            # Create data loaders
+            train_loader = create_data_loaders(train_dataset, batch_size=task_specific_params['batch_size'])
+            test_loader = create_data_loaders(test_dataset, batch_size=10, shuffle=False)
+
+            # Initialize model
+            # Align with seed logic of four-method comparison code: ITP-MAML is the 3rd method (index=3)
+            method_index = 3  # Because methods = ["TFL", "DANN", "MAML", "ITP-MAML"] in the second code
+            set_random_seed(global_seed + task_idx + method_index * 10)
+            model = MultiTaskModel(
+                input_dim=X_train.shape[1],
+                hidden_dims=FIXED_TASK_PARAMS['common']['hidden_dims'],
+                dropout_rate=task_specific_params['dropout_rate'],
+                prelu_init=task_specific_params['prelu_init']
+            ).to(device)
+
+            # Load pre-trained parameters
+            pth_path = FIXED_TASK_PARAMS['common']['pth_itp']
+            model = load_pretrained_model(
+                model, current_task, pth_path,
+                task_specific_params['prelu_init'], "ITP-MAML", current_task
+            )
+
+            # Configure optimizer
+            feat_params = []
+            out_params = []
+            for name, param in model.named_parameters():
+                if "feature_extractor" in name:
+                    feat_params.append(param)
+                elif f"task_classifier_{current_task}" in name:
+                    out_params.append(param)
+
+            optimizer = optim.AdamW([
+                {'params': feat_params, 'lr': task_specific_params['lr_feat'], 'weight_decay': 0.01},
+                {'params': out_params, 'lr': task_specific_params['lr_out'], 'weight_decay': 0.01}
+            ])
+            criterion = nn.SmoothL1Loss()
+
+            # Train model
+            model = progressive_fine_tune(model, train_loader, optimizer, criterion, task_params, "ITP-MAML")
+
+            # Test and evaluate
+            model.eval()
+            y_pred_scaled = []
+            y_true_scaled = []
+            with torch.no_grad():
+                for x, y in test_loader:
+                    x, y = x.to(device), y.to(device)
+                    y_preds = model(x)
+                    y_pred = y_preds[task_idx]
+                    y_pred_scaled.extend(y_pred.cpu().numpy())
+                    y_true_scaled.extend(y.cpu().numpy())
+
+            # Inverse standardization and metric calculation
+            y_pred = scaler_y.inverse_transform(np.array(y_pred_scaled)).flatten()
+            y_true = scaler_y.inverse_transform(np.array(y_true_scaled)).flatten()
+            mse = mean_squared_error(y_true, y_pred)
+            metrics = {
+                "MSE": mse,
+                "RMSE": math.sqrt(mse),
+                "MAE": mean_absolute_error(y_true, y_pred),
+                "R2": 1 - (np.sum((y_true - y_pred) ** 2) /
+                           (np.sum((y_true - np.mean(y_true)) ** 2) + 1e-10))
+            }
+
+            # Save results
+            all_results[current_task][sample_size] = metrics
+            all_predictions[current_task][sample_size] = y_pred  # Save predictions
+
+            print(f"ITP-MAML - {current_task} ({sample_size} samples) evaluation completed, R2: {metrics['R2']:.6f}")
+
+    return all_results, all_predictions, y_test_true, sample_sizes, tasks, target_info_map
+
+
+# -------------------------- 4. Result Visualization Function --------------------------
+def plot_comparison_figures(all_results, all_predictions, y_test_true, sample_sizes, tasks, target_info_map):
+    """Plot 4 subplots: each shows comparison between true values and predictions with different sample sizes"""
+    plt.rcParams.update({
+        'font.family': 'Times New Roman',
+        'mathtext.fontset': 'stix',
+        'font.size': 36,
+        'axes.labelsize': 36,
+        'axes.titlesize': 34,
+        'legend.fontsize': 32,
+        'xtick.labelsize': 48,
+        'ytick.labelsize': 48,
+        'text.usetex': False,
+        'axes.unicode_minus': False,
+    })
+
+    # Create 2x2 subplots
+    fig, axs = plt.subplots(2, 2, figsize=(34, 24), gridspec_kw={'hspace': 0.4, 'wspace': 0.25})
+    subplot_labels = ['(a)', '(b)', '(c)', '(d)']
+
+    # Color and marker configuration
+    colors = ['blue', 'green', 'orange', 'purple']
+    markers = ['o', 's', '^', 'D']
+    sample_labels = ['20 Samples', '30 Samples', '50 Samples', '70 Samples']
+
+    # Plot each subplot
+    for idx, (target, ax) in enumerate(zip(tasks, axs.flat)):
+        target_info = target_info_map[target]
+
+        # Get true values
+        y_true = y_test_true[target]
+        x_idx = range(len(y_true))
+
+        # Plot true values (red pentagram)
+        ax.plot(x_idx, y_true, color='red', marker='*', label='True Value',
+                linewidth=3, markersize=12, alpha=0.8)
+
+        # Plot predictions with different sample sizes
+        for j, sample_size in enumerate(sample_sizes):
+            y_pred = all_predictions[target][sample_size]
+            ax.plot(x_idx, y_pred, color=colors[j], marker=markers[j],
+                    label=sample_labels[j], linewidth=2.5, markersize=8, alpha=0.7)
+
+        # Subplot configuration
+        ax.set_title(f'{target_info["plot_name"]} Estimation Comparison-1.5MW (ITP-MAML)', fontsize=35)
+        ax.set_xlabel('Number of test sets', fontsize=44)
+        ax.set_ylabel(target_info["label"], fontsize=44)
+        ax.legend(loc='upper right', fontsize=36)
+        ax.grid(True, linestyle='--', alpha=0.6, linewidth=2)
+
+        # Scientific notation for DEL_Ts and DEL_Yb
+        if idx in [1, 3]:
+            ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 0))
+            ax.yaxis.get_offset_text().set_fontsize(44)
+
+        # Subplot label annotation
+        ax.text(0.5, -0.17, subplot_labels[idx], transform=ax.transAxes,
+                fontsize=36, ha='center', va='top')
+
+        # Display R² values in the blank area of the subplot
+        r2_texts = []
+        for j, sample_size in enumerate(sample_sizes):
+            r2_value = all_results[target][sample_size]['R2']
+            r2_texts.append(f'{sample_labels[j]} R²: {r2_value:.4f}')
+
+        # Display R² values in the upper right corner of the subplot
+        for i, text in enumerate(r2_texts):
+            ax.text(0.3, 0.9 - i * 0.08, text, transform=ax.transAxes,
+                    fontsize=32, color=colors[i], fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+
+    plt.subplots_adjust(left=0.07, right=0.93, top=0.95, bottom=0.08)
+
+    # Save figure
+    img_dir = r"E:\Codes_and_datasets\pictures"
+    save_path = os.path.join(img_dir, f"ITP-MAML-1.5MW-Data_Quantification.svg")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.show()
+    plt.close()
+    print(f"\nComparison figure saved to: {save_path}")
+
+
+def print_sample_size_results(all_results, sample_sizes, tasks):
+    """Print result table for different sample sizes"""
+    print(f"\n{'=' * 100}")
+    print(f"ITP-MAML Method - Experiment Results Summary with Different Sample Sizes")
+    print(f"{'=' * 100}")
+
+    # Print table by task
+    for task in tasks:
+        print(f"\n[Task: {task}]")
+        table_data = []
+        headers = ["Sample Size", "R²", "MSE", "RMSE", "MAE"]
+
+        for size in sample_sizes:
+            metrics = all_results[task][size]
+            row = [
+                size,
+                f"{metrics['R2']:.6f}",
+                f"{metrics['MSE']:.6g}",
+                f"{metrics['RMSE']:.6g}",
+                f"{metrics['MAE']:.6g}"
+            ]
+            table_data.append(row)
+
+        print(tabulate(table_data, headers=headers, tablefmt="grid", floatfmt=".6f"))
+
+
+# -------------------------- 5. Main Function --------------------------
+if __name__ == "__main__":
+    # Step 1: Fix global random seed
+    set_random_seed(FIXED_TASK_PARAMS['common']['seed'])
+
+    # Step 2: Conduct ITP-MAML experiments with different sample sizes
+    all_results, all_predictions, y_test_true, sample_sizes, tasks, target_info_map = evaluate_ITPMAML_with_different_samples()
+
+    # Step 3: Plot comparison figures
+    plot_comparison_figures(all_results, all_predictions, y_test_true, sample_sizes, tasks, target_info_map)
+
+    # Step 4: Print result tables
+    print_sample_size_results(all_results, sample_sizes, tasks)
+
+    # Step 5: Output completion information
+    print(f"\n{'=' * 100}")
+    print(f"🎉 ITP-MAML Method - Experiment with Different Sample Sizes Completed!")
+    print(f"{'=' * 100}")
+    print(f"Key Outputs:")
+    print(f"1. Comparison Figure: E:\\Codes_and_datasets\\pictures\\ITP-MAML-1.5MW-Data_Quantification.svg")
+    print(f"2. Experiment Sample Sizes: 20, 30, 50, 70 samples")
+    print(f"3. Test Set: Fixed 10 samples")
+    print(f"4. Target Variables: DEL_Mt, DEL_Ts, DEL_Rm, DEL_Yb")
+    print(f"{'=' * 100}")
