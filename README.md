@@ -16,11 +16,12 @@ This warehouse corresponds to the core resources of the paper Transferable Soft 
 
 4_Model_weights/  # Pretrained .pth weights (load directly for inference)
   ├─ feature_extractor.pth    # Optimal Weight and Bias of GVAM-RN Dimensionality Reduction Model
+  ├─ scalers.pkl   # It is a Python serialization file. Its core function is to save the standardizer parameters used in the data standardization process to ensure that the preprocessing logic of all data sets is completely consistent. 
   ├─ ITP-MAML.pth  # Optimal initialization parameters of ITP-MAML meta-learning framework
   ├─ MAML.pth  # Optimal initialization parameters of MAML meta-learning framework
   ├─ DANN.pth   # Optimal initialization parameters of DANN 
 
-5_pictures/   # Visualization of key experimental results in the paper
+5_others/   # Includes the training set and test set after dimensionality reduction of five dimensionality reduction methods
 
 
 2. Environment Configuration
